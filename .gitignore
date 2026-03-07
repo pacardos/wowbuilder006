@@ -1,0 +1,29 @@
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+*.VC.db
+*.VC.opendb
+*.sln
+*.opensdf
+*.sdf
+*.suo
+*.tmp
+*.log
+*.user
+*.userprefs
+*.pdb
+*.ipch
+
+# Unreal cache
+DerivedDataCache/
+
+# Rider / VSCode
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
