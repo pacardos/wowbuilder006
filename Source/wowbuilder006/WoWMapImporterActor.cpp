@@ -1,18 +1,33 @@
 #include "WoWMapImporterActor.h"
-
+// Open files
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
-
+// create dynamic meshes
 #include "DynamicMeshActor.h"
 #include "Components/DynamicMeshComponent.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "EngineUtils.h"
-
+#include "IndexTypes.h"
+// gui
 #include "Widgets/SWindow.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SUniformGridPanel.h"
 #include "Framework/Application/SlateApplication.h"
+// create water plane
+#include "Engine/StaticMeshActor.h"
+// json support to liquid parsing
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonReader.h"
+
+
+
+// maximum capacity for reference
+constexpr int32 MaxTileVertices = 37120;    // 145 × 16 × 16 vertices -> no holes
+constexpr int32 MaxTileTriangles = 70000;   // safe triangle upper bound
+
+using namespace UE::Geometry;
 
 
 
@@ -339,23 +354,69 @@ void AWoWMapImporterActor::ShowADTGrid()
     FSlateApplication::Get().AddWindow(Window.ToSharedRef());
 }
 
-
-
 void AWoWMapImporterActor::ParseSelectedADTs()
 {
     UE_LOG(LogTemp, Warning, TEXT("Selected ADTs: %d"), SelectedADTs.Num());
 
-    for (const FIntPoint& Tile : SelectedADTs)
+    if (bGenerateDynamicMesh)
     {
-        ImportTerrainOBJ(Tile);
+        UE_LOG(LogTemp, Warning, TEXT("=== TERRAIN PHASE ==="));
+
+        for (const FIntPoint& Tile : SelectedADTs)
+        {
+            ImportTerrainOBJ(Tile);
+        }
     }
+
+    if (bParseWater)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("=== WATER PHASE ==="));
+
+        for (const FIntPoint& Tile : SelectedADTs)
+        {
+            ImportWater(Tile);
+        }
+    }
+
+    if (bParseTextures)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("=== TEXTURE PHASE ==="));
+
+        for (const FIntPoint& Tile : SelectedADTs)
+        {
+            ImportTextures(Tile);
+        }
+    }
+
+    if (bParseM2)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("=== M2 DOODADS PHASE ==="));
+
+        for (const FIntPoint& Tile : SelectedADTs)
+        {
+            ImportM2Doodads(Tile);
+        }
+    }
+
+    if (bParseWMO)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("=== WMO PHASE ==="));
+
+        for (const FIntPoint& Tile : SelectedADTs)
+        {
+            ImportWMOs(Tile);
+        }
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("Parsing finished."));
 }
+
+
 
 void AWoWMapImporterActor::ImportTerrainOBJ(const FIntPoint& Tile)
 {
     FString OBJName = FString::Printf(
-        TEXT("%s_%02d_%02d.obj"),
-        *MapName,
+        TEXT("adt_%02d_%02d.obj"),
         Tile.X,
         Tile.Y
     );
@@ -452,6 +513,7 @@ void AWoWMapImporterActor::LoadOBJTile(const FString& OBJPath, const FIntPoint& 
         }
 
         MeshActor->SetActorLabel(ActorName);
+        MeshActor->SetFolderPath(TEXT("Landscape"));
 
         UE_LOG(LogTemp, Warning, TEXT("Created new terrain actor: %s"), *ActorName);
     }
@@ -484,7 +546,239 @@ void AWoWMapImporterActor::LoadOBJTile(const FString& OBJPath, const FIntPoint& 
 
 
 
-void AWoWMapImporterActor::ImportWater(const FIntPoint& Tile) {}
+void AWoWMapImporterActor::ImportWater(const FIntPoint& Tile)
+{
+    /* ------------------------------------------------------------ */
+    /* 1 — Build JSON path                                          */
+    /* ------------------------------------------------------------ */
+
+    FString FileName = FString::Printf(TEXT("liquid_%d_%d.json"), Tile.X, Tile.Y);
+    FString JSONPath = FPaths::Combine(WorkingDirectory, FileName);
+
+    if (!FPaths::FileExists(JSONPath))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("No liquid file for tile %d_%d"), Tile.X, Tile.Y);
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("Loading liquid JSON: %s"), *JSONPath);
+
+
+    /* ------------------------------------------------------------ */
+    /* 2 — Load JSON file                                           */
+    /* ------------------------------------------------------------ */
+
+    FString JSONString;
+
+    if (!FFileHelper::LoadFileToString(JSONString, *JSONPath))
+    {
+        UE_LOG(LogTemp, Error, TEXT("Failed to read liquid JSON"));
+        return;
+    }
+
+    TSharedPtr<FJsonObject> Root;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JSONString);
+
+    if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+    {
+        UE_LOG(LogTemp, Error, TEXT("Invalid liquid JSON"));
+        return;
+    }
+
+
+    /* ------------------------------------------------------------ */
+    /* 3 — Get liquidChunks array                                   */
+    /* ------------------------------------------------------------ */
+
+    const TArray<TSharedPtr<FJsonValue>>* LiquidChunks;
+
+    if (!Root->TryGetArrayField(TEXT("liquidChunks"), LiquidChunks))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("No liquidChunks found"));
+        return;
+    }
+
+
+    /* ------------------------------------------------------------ */
+    /* 4 — Iterate chunk slots (max 256)                            */
+    /* ------------------------------------------------------------ */
+
+    for (int32 ChunkIndex = 0; ChunkIndex < LiquidChunks->Num(); ChunkIndex++)
+    {
+        TSharedPtr<FJsonObject> ChunkObj = (*LiquidChunks)[ChunkIndex]->AsObject();
+
+        if (!ChunkObj.IsValid())
+            continue;
+
+
+        const TArray<TSharedPtr<FJsonValue>>* Instances;
+
+        if (!ChunkObj->TryGetArrayField(TEXT("instances"), Instances))
+            continue;
+
+
+        /* -------------------------------------------------------- */
+        /* 5 — Iterate liquid instances in chunk                    */
+        /* -------------------------------------------------------- */
+
+        for (auto& InstanceValue : *Instances)
+        {
+            TSharedPtr<FJsonObject> Instance = InstanceValue->AsObject();
+
+            if (!Instance.IsValid())
+                continue;
+
+
+            /* ---------------------------------------------------- */
+            /* 6 — Read grid size                                   */
+            /* ---------------------------------------------------- */
+
+            int32 Width = Instance->GetIntegerField(TEXT("width"));
+            int32 Height = Instance->GetIntegerField(TEXT("height"));
+            int32 LiquidType = Instance->GetIntegerField(TEXT("liquidType"));
+
+            // get the liquid name from ID
+            FString LiquidName;
+
+            switch (LiquidType)
+            {
+            case 1: LiquidName = TEXT("Water"); break;
+            case 2: LiquidName = TEXT("Ocean"); break;
+            case 3: LiquidName = TEXT("Slime"); break;
+            case 4: LiquidName = TEXT("River"); break;
+            case 6: LiquidName = TEXT("Lava"); break;
+            default: LiquidName = TEXT("Unknown"); break;
+            }
+
+            UE_LOG(LogTemp, Warning,
+                TEXT("Water instance: %d x %d type %d"),
+                Width, Height, LiquidType);
+
+
+            /* ---------------------------------------------------- */
+            /* 7 — Read world position                              */
+            /* ---------------------------------------------------- */
+
+            const TArray<TSharedPtr<FJsonValue>>* WorldPos;
+
+            if (!Instance->TryGetArrayField(TEXT("worldPosition"), WorldPos))
+                continue;
+
+            double WX = (*WorldPos)[0]->AsNumber();
+            double WY = (*WorldPos)[1]->AsNumber();
+            double WZ = (*WorldPos)[2]->AsNumber();
+
+
+            /* ---------------------------------------------------- */
+            /* 8 — Read vertex height map                           */
+            /* ---------------------------------------------------- */
+
+            const TSharedPtr<FJsonObject>* VertexData;
+
+            if (!Instance->TryGetObjectField(TEXT("vertexData"), VertexData))
+                continue;
+
+            const TArray<TSharedPtr<FJsonValue>>* HeightArray;
+
+            if (!(*VertexData)->TryGetArrayField(TEXT("height"), HeightArray))
+                continue;
+
+
+            /* ---------------------------------------------------- */
+            /* 9 — Build vertices                                   */
+            /* ---------------------------------------------------- */
+
+            TArray<FVector> Vertices;
+
+            const double Step = 4.166666 * 100.0; // WoW liquid grid spacing in cm
+
+            for (int y = 0; y <= Height; y++)
+            {
+                for (int x = 0; x <= Width; x++)
+                {
+                    int Index = y * (Width + 1) + x;
+
+                    double HeightValue = (*HeightArray)[Index]->AsNumber();
+
+                    double OffsetX = (x - Width / 2.0) * Step;
+                    double OffsetY = (y - Height / 2.0) * Step;
+
+                    double VX = WX * 100.0 - OffsetX;
+                    double VY = -(WZ * 100.0 - OffsetY);
+                    double VZ = HeightValue * 100.0;
+
+                    Vertices.Add(FVector(VX, VY, VZ));
+                }
+            }
+
+
+            /* ---------------------------------------------------- */
+            /* 10 — Build triangles                                 */
+            /* ---------------------------------------------------- */
+
+            TArray<FIndex3i> Triangles;
+
+            for (int y = 0; y < Height; y++)
+            {
+                for (int x = 0; x < Width; x++)
+                {
+                    int v0 = y * (Width + 1) + x;
+                    int v1 = v0 + 1;
+                    int v2 = v0 + (Width + 1);
+                    int v3 = v2 + 1;
+
+                    Triangles.Add(FIndex3i(v0, v2, v1));
+                    Triangles.Add(FIndex3i(v1, v2, v3));
+                }
+            }
+
+
+            /* ---------------------------------------------------- */
+            /* 11 — Build dynamic mesh                              */
+            /* ---------------------------------------------------- */
+
+            UE::Geometry::FDynamicMesh3 Mesh;
+
+            for (const FVector& V : Vertices)
+            {
+                Mesh.AppendVertex((FVector3d)V);
+            }
+
+            for (const FIndex3i& T : Triangles)
+            {
+                Mesh.AppendTriangle(T);
+            }
+
+
+            /* ---------------------------------------------------- */
+            /* 12 — Spawn water actor                               */
+            /* ---------------------------------------------------- */
+
+            ADynamicMeshActor* WaterActor =
+                GetWorld()->SpawnActor<ADynamicMeshActor>();
+
+            if (!WaterActor)
+                continue;
+
+            WaterActor->GetDynamicMeshComponent()->SetMesh(MoveTemp(Mesh));
+
+            WaterActor->SetActorRotation(FRotator(0.f, 90.f, 180.f));
+
+            WaterActor->SetActorLabel(
+                FString::Printf(TEXT("Liquid_%s_%d_%d"), *LiquidName, Tile.X, Tile.Y)
+            );
+
+            WaterActor->SetFolderPath(TEXT("LiquidBody"));
+        }
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("Water import finished."));
+}
+
+
+
+
+
 void AWoWMapImporterActor::ImportTextures(const FIntPoint& Tile) {}
 void AWoWMapImporterActor::ImportM2Doodads(const FIntPoint& Tile) {}
 void AWoWMapImporterActor::ImportWMOs(const FIntPoint& Tile) {}

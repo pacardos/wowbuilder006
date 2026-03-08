@@ -10,8 +10,9 @@ public class wowbuilder006 : ModuleRules
 
 		PublicDependencyModuleNames.AddRange(new string[] {
 			"Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput",
-			"GeometryFramework", "GeometryCore", "DynamicMesh"
-		});
+			"GeometryFramework", "GeometryCore", "DynamicMesh",
+			"Json", "JsonUtilities", "GeometryCore"
+        });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
 			"Slate", "SlateCore"

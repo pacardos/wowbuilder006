@@ -53,6 +53,8 @@ private:
     void LoadOBJTile(const FString& OBJPath, const FIntPoint& Tile);
 
     void ImportWater(const FIntPoint& Tile);
+
+
     void ImportTextures(const FIntPoint& Tile);
     void ImportM2Doodads(const FIntPoint& Tile);
     void ImportWMOs(const FIntPoint& Tile);
