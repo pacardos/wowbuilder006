@@ -45,17 +45,25 @@ private:
     FString GetTagString(uint32 Tag);
     
     void ParseWDT(const TArray<uint8>& Data);
-    void ShowADTGrid();
+    void ShowTileGrid();
 
-    void ParseSelectedADTs();
+    void ParseSelectedTiles();
 
     void ImportTerrainOBJ(const FIntPoint& Tile);
     void LoadOBJTile(const FString& OBJPath, const FIntPoint& Tile);
 
     void ImportWater(const FIntPoint& Tile);
 
-
     void ImportTextures(const FIntPoint& Tile);
+    UMaterialInstanceConstant* CreateOrGetMaterialInstance(const FString& Name, const FString& Folder);
+    TArray<FString> GetTexturePathsFromList(const FIntPoint& Tile);
+    FString ConvertWoWPathToUnreal(FString WoWPath);
+    void ApplyMaterialToActor(FString InActorLabel, UMaterialInterface* Mat);
+
+
+
+
+
     void ImportM2Doodads(const FIntPoint& Tile);
     void ImportWMOs(const FIntPoint& Tile);
 };

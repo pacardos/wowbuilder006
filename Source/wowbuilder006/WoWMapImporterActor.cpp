@@ -1,4 +1,4 @@
-#include "WoWMapImporterActor.h"
+ï»¿#include "WoWMapImporterActor.h"
 // Open files
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -21,13 +21,27 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
 
+#include "Algo/MinElement.h"
+#include "Algo/MaxElement.h"
+// textures
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetToolsModule.h"
+#include "Factories/MaterialInstanceConstantFactoryNew.h"
+#include "Materials/MaterialInstanceConstant.h"
+#include "RenderingThread.h" // Required for FlushRenderingCommands
+
 
 
 // maximum capacity for reference
-constexpr int32 MaxTileVertices = 37120;    // 145 × 16 × 16 vertices -> no holes
+constexpr int32 MaxTileVertices = 37120;    // 145 Ã— 16 Ã— 16 vertices -> no holes
 constexpr int32 MaxTileTriangles = 70000;   // safe triangle upper bound
 
 using namespace UE::Geometry;
+
+// wow reference values
+constexpr float WOW_TILE_SIZE = (1600.0f / 3.0f) * 100.0f;          // 53333.333
+constexpr float WOW_CHUNK_SIZE = WOW_TILE_SIZE / 16.0f;             // 3333.333
+constexpr float WOW_QUAD_SIZE = WOW_TILE_SIZE / (16.0f * 8.0f);     // 416.666
 
 
 
@@ -139,12 +153,12 @@ void AWoWMapImporterActor::ParseWDT(const TArray<uint8>& Data)
         return;
     }
 
-    ShowADTGrid();
+    ShowTileGrid();
 }
 
 
 
-void AWoWMapImporterActor::ShowADTGrid()
+void AWoWMapImporterActor::ShowTileGrid()
 {
     SelectedADTs.Empty();
 
@@ -329,7 +343,7 @@ void AWoWMapImporterActor::ShowADTGrid()
                         .Text(FText::FromString("Parse"))
                         .OnClicked_Lambda([this]()
                             {
-                                ParseSelectedADTs();
+                                ParseSelectedTiles();
                                 return FReply::Handled();
                             })
                 ]
@@ -354,7 +368,7 @@ void AWoWMapImporterActor::ShowADTGrid()
     FSlateApplication::Get().AddWindow(Window.ToSharedRef());
 }
 
-void AWoWMapImporterActor::ParseSelectedADTs()
+void AWoWMapImporterActor::ParseSelectedTiles()
 {
     UE_LOG(LogTemp, Warning, TEXT("Selected ADTs: %d"), SelectedADTs.Num());
 
@@ -416,7 +430,7 @@ void AWoWMapImporterActor::ParseSelectedADTs()
 void AWoWMapImporterActor::ImportTerrainOBJ(const FIntPoint& Tile)
 {
     FString OBJName = FString::Printf(
-        TEXT("adt_%02d_%02d.obj"),
+        TEXT("adt_%d_%d.obj"),
         Tile.X,
         Tile.Y
     );
@@ -431,53 +445,104 @@ void AWoWMapImporterActor::ImportTerrainOBJ(const FIntPoint& Tile)
 void AWoWMapImporterActor::LoadOBJTile(const FString& OBJPath, const FIntPoint& Tile)
 {
     TArray<FString> Lines;
-
-    if (!FFileHelper::LoadFileToStringArray(Lines, *OBJPath))
-    {
-        UE_LOG(LogTemp, Error, TEXT("Failed to load OBJ."));
-        return;
-    }
+    if (!FFileHelper::LoadFileToStringArray(Lines, *OBJPath)) return;
 
     UE::Geometry::FDynamicMesh3 Mesh;
+    Mesh.EnableAttributes();
+    FDynamicMeshUVOverlay* UVOverlay = Mesh.Attributes()->PrimaryUV();
 
+    TArray<int32> UVHandles;
+
+    // --- PASS 1: VERTICES ONLY ---
     for (const FString& Line : Lines)
     {
         if (Line.StartsWith("v "))
         {
             TArray<FString> Parts;
             Line.ParseIntoArray(Parts, TEXT(" "), true);
-
-            float X = FCString::Atof(*Parts[1]);
-            float Y = FCString::Atof(*Parts[2]);
-            float Z = FCString::Atof(*Parts[3]);
-
-            FVector UEVertex(
-                -Z * 100.f,
-                X * 100.f,
-                Y * 100.f
-            );
-
+            // Your existing Vertex math
+            FVector UEVertex(-FCString::Atof(*Parts[3]) * 100.f, FCString::Atof(*Parts[1]) * 100.f, FCString::Atof(*Parts[2]) * 100.f);
             Mesh.AppendVertex(FVector3d(UEVertex));
         }
     }
 
+    // --- PASS 2: GENERATE UV HANDLES (The Missing Step) ---
+    TArray<int32> GlobalUVHandles;
+    FAxisAlignedBox3d Bounds = Mesh.GetBounds();
+    FVector3d Min = Bounds.Min;
+    FVector3d Max = Bounds.Max;
+    FVector3d MeshSize = Max - Min;
+
+    double DivX = (MeshSize.X > 0.0001) ? MeshSize.X : 1.0;
+    double DivY = (MeshSize.Y > 0.0001) ? MeshSize.Y : 1.0;
+
+    // Important: Use Mesh.MaxVertexID() to ensure we match the mesh exactly
+    for (int32 i = 0; i < Mesh.MaxVertexID(); ++i)
+    {
+        FVector3d P = Mesh.GetVertex(i);
+
+        // get the standard 0-1 normalized coordinates
+        float NormX = (float)((P.X - Min.X) / DivX);
+        float NormY = (float)((P.Y - Min.Y) / DivY);
+
+        // Apply 90 degree CCW Rotation:
+        // NewU = NormY
+        // NewV = 1.0 - NormX
+        float RotatedU = 1.0f - NormY;
+        float RotatedV = 1.0f - NormX;
+
+        // This fills the array so the next loop doesn't crash!
+        GlobalUVHandles.Add(UVOverlay->AppendElement(FVector2f(RotatedU, RotatedV)));
+    }
+
+    // --- PASS 3: FACES ---
     for (const FString& Line : Lines)
     {
-        if (Line.StartsWith("f "))
+        if (Line.StartsWith(TEXT("f ")))
         {
             TArray<FString> Parts;
             Line.ParseIntoArray(Parts, TEXT(" "), true);
 
-            int v0 = FCString::Atoi(*Parts[1]) - 1;
-            int v1 = FCString::Atoi(*Parts[2]) - 1;
-            int v2 = FCString::Atoi(*Parts[3]) - 1;
+            // We need at least 4 parts: "f", "v1/vt1/vn1", "v2/vt2/vn2", "v3/vt3/vn3"
+            if (Parts.Num() < 4) continue;
 
-            Mesh.AppendTriangle(v0, v1, v2);
+            // Lambda helper to grab the first number (vertex index) from the v/vt/vn string
+            auto GetVIdx = [](const FString& InPart) -> int32 {
+                FString VPart;
+                // Split by '/' and take the left side
+                if (InPart.Split(TEXT("/"), &VPart, nullptr))
+                {
+                    return FCString::Atoi(*VPart) - 1; // OBJ is 1-indexed
+                }
+                return FCString::Atoi(*InPart) - 1; // Fallback if no '/' exists
+                };
+
+            // NOW we declare them so the compiler can find them
+            int32 v0 = GetVIdx(Parts[1]);
+            int32 v1 = GetVIdx(Parts[2]);
+            int32 v2 = GetVIdx(Parts[3]);
+
+            int32 TriID = Mesh.AppendTriangle(v0, v1, v2);
+
+            if (TriID != IndexConstants::InvalidID)
+            {
+                // Safety check against the GlobalUVHandles array we built in Pass 2
+                if (GlobalUVHandles.IsValidIndex(v0) &&
+                    GlobalUVHandles.IsValidIndex(v1) &&
+                    GlobalUVHandles.IsValidIndex(v2))
+                {
+                    UVOverlay->SetTriangle(TriID, FIndex3i(
+                        GlobalUVHandles[v0],
+                        GlobalUVHandles[v1],
+                        GlobalUVHandles[v2]
+                    ));
+                }
+            }
         }
     }
 
     FString ActorName = FString::Printf(
-        TEXT("%s_%02d_%02d"),
+        TEXT("%s_%d_%d"),
         *MapName,
         Tile.X,
         Tile.Y
@@ -534,6 +599,31 @@ void AWoWMapImporterActor::LoadOBJTile(const FString& OBJPath, const FIntPoint& 
     UE_LOG(LogTemp, Warning, TEXT("Terrain mesh generated for %s"), *ActorName);
 
     /* ---------------------------------- */
+    /* check if we already                */
+    /*             have the material made */
+    /* ---------------------------------- */
+    // 1. Try to find the specific Material Instance for this tile
+    FString TileID = FString::Printf(TEXT("%s_%d_%d"), *MapName, Tile.X, Tile.Y);
+    FString MIPath = FString::Printf(TEXT("/Game/maps/%s/materials/MI_%s.%s"), *MapName, *TileID, *TileID);
+
+    // TRY to load the material
+    UMaterialInterface* CurrentMat = LoadObject<UMaterialInstanceConstant>(nullptr, *MIPath);
+
+    // IF NOT FOUND, use the Master Debug as a placeholder
+    if (!CurrentMat)
+    {
+        CurrentMat = LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/test-zone/M_WoWTerrain_Debug"));
+        UE_LOG(LogTemp, Warning, TEXT("Mesh %s: Material Instance not found, using Debug Master."), *TileID);
+    }
+    
+    if (CurrentMat && MeshComponent)
+    {
+        MeshComponent->SetMaterial(0, CurrentMat);
+    }
+
+    MeshComponent->SetNumMaterials(1);
+
+    /* ---------------------------------- */
     /* Enable Collision                   */
     /* ---------------------------------- */
 
@@ -548,116 +638,119 @@ void AWoWMapImporterActor::LoadOBJTile(const FString& OBJPath, const FIntPoint& 
 
 void AWoWMapImporterActor::ImportWater(const FIntPoint& Tile)
 {
-    /* ------------------------------------------------------------ */
-    /* 1 — Build JSON path                                          */
-    /* ------------------------------------------------------------ */
+    //---------------------------------------------------------
+    // Build JSON path
+    //---------------------------------------------------------
 
-    FString FileName = FString::Printf(TEXT("liquid_%d_%d.json"), Tile.X, Tile.Y);
-    FString JSONPath = FPaths::Combine(WorkingDirectory, FileName);
+    FString JsonName = FString::Printf(TEXT("liquid_%d_%d.json"), Tile.X, Tile.Y);
+    FString JsonPath = FPaths::Combine(WorkingDirectory, JsonName);
 
-    if (!FPaths::FileExists(JSONPath))
+    if (!FPaths::FileExists(JsonPath))
     {
         UE_LOG(LogTemp, Warning, TEXT("No liquid file for tile %d_%d"), Tile.X, Tile.Y);
         return;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("Loading liquid JSON: %s"), *JSONPath);
-
-
-    /* ------------------------------------------------------------ */
-    /* 2 — Load JSON file                                           */
-    /* ------------------------------------------------------------ */
-
-    FString JSONString;
-
-    if (!FFileHelper::LoadFileToString(JSONString, *JSONPath))
+    FString JsonText;
+    if (!FFileHelper::LoadFileToString(JsonText, *JsonPath))
     {
-        UE_LOG(LogTemp, Error, TEXT("Failed to read liquid JSON"));
+        UE_LOG(LogTemp, Warning, TEXT("Failed to read liquid json"));
         return;
     }
 
+    //---------------------------------------------------------
+    // Parse JSON
+    //---------------------------------------------------------
+
     TSharedPtr<FJsonObject> Root;
-    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JSONString);
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
 
     if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
     {
-        UE_LOG(LogTemp, Error, TEXT("Invalid liquid JSON"));
+        UE_LOG(LogTemp, Warning, TEXT("Invalid liquid JSON"));
         return;
     }
-
-
-    /* ------------------------------------------------------------ */
-    /* 3 — Get liquidChunks array                                   */
-    /* ------------------------------------------------------------ */
 
     const TArray<TSharedPtr<FJsonValue>>* LiquidChunks;
 
     if (!Root->TryGetArrayField(TEXT("liquidChunks"), LiquidChunks))
-    {
-        UE_LOG(LogTemp, Warning, TEXT("No liquidChunks found"));
         return;
-    }
 
+    //---------------------------------------------------------
+    // Build ONE mesh for the entire tile
+    //---------------------------------------------------------
 
-    /* ------------------------------------------------------------ */
-    /* 4 — Iterate chunk slots (max 256)                            */
-    /* ------------------------------------------------------------ */
+    UE::Geometry::FDynamicMesh3 Mesh;
 
-    for (int32 ChunkIndex = 0; ChunkIndex < LiquidChunks->Num(); ChunkIndex++)
+    FVector TileOrigin;
+    bool bTileOriginSet = false;
+
+    FString LiquidName = TEXT("Liquid");
+
+    //---------------------------------------------------------
+    // Iterate chunks
+    //---------------------------------------------------------
+
+    for (const TSharedPtr<FJsonValue>& ChunkValue : *LiquidChunks)
     {
-        TSharedPtr<FJsonObject> ChunkObj = (*LiquidChunks)[ChunkIndex]->AsObject();
-
-        if (!ChunkObj.IsValid())
+        const TSharedPtr<FJsonObject> Chunk = ChunkValue->AsObject();
+        if (!Chunk.IsValid())
             continue;
-
 
         const TArray<TSharedPtr<FJsonValue>>* Instances;
 
-        if (!ChunkObj->TryGetArrayField(TEXT("instances"), Instances))
+        if (!Chunk->TryGetArrayField(TEXT("instances"), Instances))
             continue;
 
+        //-----------------------------------------------------
+        // Iterate liquid instances
+        //-----------------------------------------------------
 
-        /* -------------------------------------------------------- */
-        /* 5 — Iterate liquid instances in chunk                    */
-        /* -------------------------------------------------------- */
-
-        for (auto& InstanceValue : *Instances)
+        for (const TSharedPtr<FJsonValue>& InstanceValue : *Instances)
         {
-            TSharedPtr<FJsonObject> Instance = InstanceValue->AsObject();
-
+            const TSharedPtr<FJsonObject> Instance = InstanceValue->AsObject();
             if (!Instance.IsValid())
                 continue;
-
-
-            /* ---------------------------------------------------- */
-            /* 6 — Read grid size                                   */
-            /* ---------------------------------------------------- */
 
             int32 Width = Instance->GetIntegerField(TEXT("width"));
             int32 Height = Instance->GetIntegerField(TEXT("height"));
             int32 LiquidType = Instance->GetIntegerField(TEXT("liquidType"));
 
-            // get the liquid name from ID
-            FString LiquidName;
+            float MinHeight = (float)Instance->GetNumberField(TEXT("minHeightLevel"));
+            float MaxHeight = (float)Instance->GetNumberField(TEXT("maxHeightLevel"));
+
+
+            //-------------------------------------------------
+            // Compute chunk position
+            //-------------------------------------------------
+
+            int32 ChunkIndex = Instance->GetIntegerField(TEXT("chunkIndex"));
+
+            int32 ChunkX = ChunkIndex % 16;
+            int32 ChunkY = ChunkIndex / 16;
+
+            // float ChunkOffsetX = ChunkX * WOW_CHUNK_SIZE;
+            float ChunkOffsetX = ChunkX * WOW_CHUNK_SIZE;
+            float ChunkOffsetY = ChunkY * WOW_CHUNK_SIZE;
+
+            //-------------------------------------------------
+            // Liquid type name
+            //-------------------------------------------------
 
             switch (LiquidType)
             {
             case 1: LiquidName = TEXT("Water"); break;
             case 2: LiquidName = TEXT("Ocean"); break;
-            case 3: LiquidName = TEXT("Slime"); break;
-            case 4: LiquidName = TEXT("River"); break;
+            case 3: LiquidName = TEXT("Magma"); break;
+            case 4: LiquidName = TEXT("Slime"); break;
+            case 5: LiquidName = TEXT("River"); break;
             case 6: LiquidName = TEXT("Lava"); break;
-            default: LiquidName = TEXT("Unknown"); break;
+            default: LiquidName = TEXT("Liquid"); break;
             }
 
-            UE_LOG(LogTemp, Warning,
-                TEXT("Water instance: %d x %d type %d"),
-                Width, Height, LiquidType);
-
-
-            /* ---------------------------------------------------- */
-            /* 7 — Read world position                              */
-            /* ---------------------------------------------------- */
+            //-------------------------------------------------
+            // World position
+            //-------------------------------------------------
 
             const TArray<TSharedPtr<FJsonValue>>* WorldPos;
 
@@ -668,117 +761,341 @@ void AWoWMapImporterActor::ImportWater(const FIntPoint& Tile)
             double WY = (*WorldPos)[1]->AsNumber();
             double WZ = (*WorldPos)[2]->AsNumber();
 
+            FVector WorldLocation(
+                -WZ * 100.f,
+                WX * 100.f,
+                WY * 100.f
+            );
 
-            /* ---------------------------------------------------- */
-            /* 8 — Read vertex height map                           */
-            /* ---------------------------------------------------- */
+            if (!bTileOriginSet)
+            {
+                TileOrigin = WorldLocation;
+                bTileOriginSet = true;
+            }
+
+            //-------------------------------------------------
+            // Get bitmap
+            //-------------------------------------------------
+
+            const TArray<TSharedPtr<FJsonValue>>* Bitmap = nullptr;
+
+            bool UseBitmap = Instance->TryGetArrayField(TEXT("bitmap"), Bitmap)
+                && Bitmap
+                && Bitmap->Num() > 0;
+
+            int32 MaxBitmapBytes = (Width * Height + 7) / 8;
+
+            //-------------------------------------------------
+            // Height map
+            //-------------------------------------------------
+
+            TArray<float> HeightMap;
 
             const TSharedPtr<FJsonObject>* VertexData;
 
-            if (!Instance->TryGetObjectField(TEXT("vertexData"), VertexData))
-                continue;
-
-            const TArray<TSharedPtr<FJsonValue>>* HeightArray;
-
-            if (!(*VertexData)->TryGetArrayField(TEXT("height"), HeightArray))
-                continue;
-
-
-            /* ---------------------------------------------------- */
-            /* 9 — Build vertices                                   */
-            /* ---------------------------------------------------- */
-
-            TArray<FVector> Vertices;
-
-            const double Step = 4.166666 * 100.0; // WoW liquid grid spacing in cm
-
-            for (int y = 0; y <= Height; y++)
+            if (Instance->TryGetObjectField(TEXT("vertexData"), VertexData))
             {
-                for (int x = 0; x <= Width; x++)
+                const TArray<TSharedPtr<FJsonValue>>* HeightArray;
+
+                if ((*VertexData)->TryGetArrayField(TEXT("height"), HeightArray))
                 {
-                    int Index = y * (Width + 1) + x;
+                    HeightMap.Reserve(HeightArray->Num());
 
-                    double HeightValue = (*HeightArray)[Index]->AsNumber();
-
-                    double OffsetX = (x - Width / 2.0) * Step;
-                    double OffsetY = (y - Height / 2.0) * Step;
-
-                    double VX = WX * 100.0 - OffsetX;
-                    double VY = -(WZ * 100.0 - OffsetY);
-                    double VZ = HeightValue * 100.0;
-
-                    Vertices.Add(FVector(VX, VY, VZ));
+                    for (const TSharedPtr<FJsonValue>& V : *HeightArray)
+                        HeightMap.Add((float)V->AsNumber());
                 }
             }
 
+            //-------------------------------------------------
+            // Vertex counts
+            //-------------------------------------------------
 
-            /* ---------------------------------------------------- */
-            /* 10 — Build triangles                                 */
-            /* ---------------------------------------------------- */
+            int32 VertCountX = Width + 1;
+            int32 VertCountY = Height + 1;
 
-            TArray<FIndex3i> Triangles;
+            float QuadSize = WOW_QUAD_SIZE;
 
-            for (int y = 0; y < Height; y++)
+            int32 VertexOffset = Mesh.VertexCount();
+
+            //-------------------------------------------------
+            // Build vertices
+            //-------------------------------------------------
+
+            for (int32 y = 0; y < VertCountY; y++)
             {
-                for (int x = 0; x < Width; x++)
+                for (int32 x = 0; x < VertCountX; x++)
                 {
-                    int v0 = y * (Width + 1) + x;
+                    float HeightWoW;
+
+                    int32 VertIdx = y * VertCountX + x;
+
+                    if (HeightMap.Num() > 0 && VertIdx < HeightMap.Num())
+                    {
+                        HeightWoW = HeightMap[VertIdx];
+                    }
+                    else
+                    {
+                        HeightWoW = WY;   // flat liquid surface
+                    }
+
+                    float Z = (HeightWoW - WY) * 100.f;
+
+                    FVector Pos(
+                        -(ChunkOffsetY + y * QuadSize),
+                        (ChunkOffsetX + x * QuadSize),
+                        Z
+                    );
+
+                    UE_LOG(LogTemp, Warning,
+                        TEXT("Instance height: %f | vertex height: %f"),
+                        WY,
+                        HeightWoW
+                    );
+
+                    Mesh.AppendVertex((FVector3d)Pos);
+                }
+            }
+
+            //-------------------------------------------------
+            // Quad bitmap test
+            //-------------------------------------------------
+
+            auto QuadExists = [&](int32 X, int32 Y)
+                {
+                    if (!UseBitmap)
+                        return true;
+
+                    int32 Index = Y * Width + X;
+
+                    int32 ByteIndex = Index >> 3;
+                    int32 BitIndex = Index & 7;
+
+                    if (ByteIndex >= MaxBitmapBytes)
+                        return true;
+
+                    uint8 Byte = (uint8)(*Bitmap)[ByteIndex]->AsNumber();
+
+                    return ((Byte >> BitIndex) & 1) != 0;
+                };
+
+            //-------------------------------------------------
+            // Build triangles
+            //-------------------------------------------------
+
+            for (int32 y = 0; y < Height; y++)
+            {
+                for (int32 x = 0; x < Width; x++)
+                {
+                    if (!QuadExists(x, y))
+                        continue;
+
+                    int v0 = VertexOffset + y * VertCountX + x;
                     int v1 = v0 + 1;
-                    int v2 = v0 + (Width + 1);
+                    int v2 = v0 + VertCountX;
                     int v3 = v2 + 1;
 
-                    Triangles.Add(FIndex3i(v0, v2, v1));
-                    Triangles.Add(FIndex3i(v1, v2, v3));
+                    Mesh.AppendTriangle(v0, v2, v1);
+                    Mesh.AppendTriangle(v1, v2, v3);
                 }
             }
-
-
-            /* ---------------------------------------------------- */
-            /* 11 — Build dynamic mesh                              */
-            /* ---------------------------------------------------- */
-
-            UE::Geometry::FDynamicMesh3 Mesh;
-
-            for (const FVector& V : Vertices)
-            {
-                Mesh.AppendVertex((FVector3d)V);
-            }
-
-            for (const FIndex3i& T : Triangles)
-            {
-                Mesh.AppendTriangle(T);
-            }
-
-
-            /* ---------------------------------------------------- */
-            /* 12 — Spawn water actor                               */
-            /* ---------------------------------------------------- */
-
-            ADynamicMeshActor* WaterActor =
-                GetWorld()->SpawnActor<ADynamicMeshActor>();
-
-            if (!WaterActor)
-                continue;
-
-            WaterActor->GetDynamicMeshComponent()->SetMesh(MoveTemp(Mesh));
-
-            WaterActor->SetActorRotation(FRotator(0.f, 90.f, 180.f));
-
-            WaterActor->SetActorLabel(
-                FString::Printf(TEXT("Liquid_%s_%d_%d"), *LiquidName, Tile.X, Tile.Y)
-            );
-
-            WaterActor->SetFolderPath(TEXT("LiquidBody"));
         }
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("Water import finished."));
+    //---------------------------------------------------------
+    // Spawn actor (ONE per tile)
+    //---------------------------------------------------------
+
+    if (Mesh.VertexCount() == 0)
+        return;
+
+    ADynamicMeshActor* WaterActor = GetWorld()->SpawnActor<ADynamicMeshActor>();
+
+    if (!WaterActor)
+        return;
+
+    WaterActor->GetDynamicMeshComponent()->SetMesh(MoveTemp(Mesh));
+
+    WaterActor->SetActorLocation(TileOrigin);
+
+    WaterActor->SetActorRotation(FRotator(0.f, 90.f, 180.f));
+
+    WaterActor->SetActorLabel(
+        FString::Printf(TEXT("Liquid_%s_%d_%d"), *LiquidName, Tile.X, Tile.Y)
+    );
+
+    WaterActor->SetFolderPath(TEXT("LiquidBody"));
+}
+
+
+
+void AWoWMapImporterActor::ImportTextures(const FIntPoint& Tile)
+{
+    // 1. Setup Standardized Names
+    FString TileID = FString::Printf(TEXT("%s_%d_%d"), *MapName, Tile.X, Tile.Y);
+    FString MIFolder = FString::Printf(TEXT("/Game/maps/%s/materials"), *MapName);
+    FString MIName = FString::Printf(TEXT("MI_%s"), *TileID);
+
+    UE_LOG(LogTemp, Log, TEXT("Starting Texture Import for Tile: %s"), *TileID);
+
+    // 2. Get the Texture List from your tool's file_list.txt
+    TArray<FString> WoWPaths = GetTexturePathsFromList(Tile);
+
+    // 3. Create or Load the Material Instance
+    UMaterialInstanceConstant* MIC = CreateOrGetMaterialInstance(MIName, MIFolder);
+
+    if (MIC)
+    {
+        // 4. Assign the 4 Diffuse Layers
+        for (int32 i = 0; i < 4; i++)
+        {
+            FName ParamName = FName(*FString::Printf(TEXT("Layer_%d"), i));
+            UTexture2D* LayerTex = nullptr;
+
+            if (i < WoWPaths.Num())
+            {
+                FString UnrealPath = ConvertWoWPathToUnreal(WoWPaths[i]);
+                LayerTex = LoadObject<UTexture2D>(nullptr, *UnrealPath);
+            }
+
+            // Pink Fallback if texture is missing or slot is empty
+            if (!LayerTex)
+            {
+                LayerTex = LoadObject<UTexture2D>(nullptr, TEXT("/Game/maps/textures/T_Error_White"));
+            }
+
+            MIC->SetTextureParameterValueEditorOnly(ParamName, LayerTex);
+        }
+
+        // 5. Link the Splatmap (The PNG from your tool)
+        FString SplatPath = FString::Printf(TEXT("/Game/maps/%s/textures/Splat_%d_%d"), *MapName, Tile.X, Tile.Y);
+        UTexture2D* SplatTex = LoadObject<UTexture2D>(nullptr, *SplatPath);
+
+        if (SplatTex)
+        {
+            // 1. Tell Unreal to pause background tasks for this texture
+            SplatTex->PreEditChange(nullptr);
+
+            // 2. Apply your settings
+            SplatTex->SRGB = false;
+            SplatTex->CompressionSettings = TC_Masks;
+            SplatTex->MipGenSettings = TMGS_NoMipmaps;
+
+            // 3. Tell Unreal to re-register and compile the texture
+            SplatTex->PostEditChange();
+
+            // 4. Update the Material Instance parameter
+            MIC->SetTextureParameterValueEditorOnly(FName("Splatmap"), SplatTex);
+        }
+
+        // 6. Finalize Asset and Apply to World Actor
+        MIC->PostEditChange();
+        ApplyMaterialToActor(TileID, MIC);
+    }
+    // This forces the GPU to finish all pending work before the loop continues
+    FlushRenderingCommands();
+}
+
+UMaterialInstanceConstant* AWoWMapImporterActor::CreateOrGetMaterialInstance(const FString& Name, const FString& Folder)
+{
+    // 1. Build the "Full Reference" path: /Game/Path/Name.Name
+    FString FullReference = FString::Printf(TEXT("%s/%s.%s"), *Folder, *Name, *Name);
+
+    // 2. Try to load using the Full Reference
+    UMaterialInstanceConstant* MIC = LoadObject<UMaterialInstanceConstant>(nullptr, *FullReference);
+
+    // 3. Load the Master Material
+    UMaterialInterface* MasterMat = LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/maps/materials/M_WoW_Terrain_Master"));
+
+    if (!MasterMat) {
+        UE_LOG(LogTemp, Error, TEXT("CRITICAL: Master Material NOT found!"));
+        return nullptr;
+    }
+
+    // 4. Create if it doesn't exist
+    if (!MIC)
+    {
+        IAssetTools& AssetTools = FModuleManager::GetModuleChecked<FAssetToolsModule>("AssetTools").Get();
+        auto Factory = NewObject<UMaterialInstanceConstantFactoryNew>();
+        UObject* NewAsset = AssetTools.CreateAsset(Name, Folder, UMaterialInstanceConstant::StaticClass(), Factory);
+        MIC = Cast<UMaterialInstanceConstant>(NewAsset);
+    }
+
+    // 5. Ensure Parent and Tiling are correct
+    if (MIC)
+    {
+        if (MIC->Parent != MasterMat) MIC->SetParentEditorOnly(MasterMat);
+
+        // Ensure tiling isn't 0 (which causes solid color)
+        MIC->SetScalarParameterValueEditorOnly(FName("Tiling_Factor"), 20.0f);
+
+        MIC->PostEditChange();
+        MIC->MarkPackageDirty();
+    }
+
+    return MIC;
+}
+
+TArray<FString> AWoWMapImporterActor::GetTexturePathsFromList(const FIntPoint& Tile)
+{
+    TArray<FString> FoundTextures;
+    FString FilePath = FString::Printf(TEXT("E:/WoW_Export/maps/%s/textures/file_list.txt"), *MapName);
+
+    TArray<FString> Lines;
+    if (FFileHelper::LoadFileToStringArray(Lines, *FilePath))
+    {
+        FString TargetHeader = FString::Printf(TEXT("--- %s_%d_%d ---"), *MapName, Tile.X, Tile.Y);
+        bool bRecording = false;
+
+        for (const FString& Line : Lines)
+        {
+            if (Line.Contains(TargetHeader)) { bRecording = true; continue; }
+            if (bRecording)
+            {
+                if (Line.StartsWith(TEXT("---")) || Line.IsEmpty()) break;
+                FoundTextures.Add(Line.TrimStartAndEnd());
+            }
+        }
+    }
+    return FoundTextures;
+}
+
+FString AWoWMapImporterActor::ConvertWoWPathToUnreal(FString WoWPath)
+{
+    // 1. Clean up slashes and remove spaces from the entire string
+    FString CWUCleanPath = WoWPath.Replace(TEXT("\\"), TEXT("/")).Replace(TEXT(" "), TEXT(""));
+
+    // 2. Extract components
+    // BaseName: "BadlandsRock"
+    FString CWUBaseName = FPaths::GetBaseFilename(CWUCleanPath);
+
+    // FolderPath: "Tileset/TheBadlands"
+    FString CWUFolderPath = FPaths::GetPath(CWUCleanPath);
+
+    // 3. Build the final Unreal Reference
+    // Result: "/Game/Tileset/TheBadlands/BadlandsRock.BadlandsRock"
+    FString CWUFinalPath = FString::Printf(TEXT("/Game/%s/%s.%s"), *CWUFolderPath, *CWUBaseName, *CWUBaseName);
+
+    return CWUFinalPath;
+}
+
+void AWoWMapImporterActor::ApplyMaterialToActor(FString InActorLabel, UMaterialInterface* Mat)
+{
+    for (TActorIterator<ADynamicMeshActor> It(GetWorld()); It; ++It)
+    {
+        if (It->GetActorLabel() == InActorLabel)
+        {
+            It->GetDynamicMeshComponent()->SetMaterial(0, Mat);
+            break;
+        }
+    }
 }
 
 
 
 
 
-void AWoWMapImporterActor::ImportTextures(const FIntPoint& Tile) {}
+
+
+
 void AWoWMapImporterActor::ImportM2Doodads(const FIntPoint& Tile) {}
 void AWoWMapImporterActor::ImportWMOs(const FIntPoint& Tile) {}
