@@ -449,9 +449,17 @@ void AWoWMapImporterActor::LoadOBJTile(const FString& OBJPath, const FIntPoint& 
 
     UE::Geometry::FDynamicMesh3 Mesh;
     Mesh.EnableAttributes();
+    // enable uv attribute
     FDynamicMeshUVOverlay* UVOverlay = Mesh.Attributes()->PrimaryUV();
-
     TArray<int32> UVHandles;
+    // enable normals attribute
+    FDynamicMeshNormalOverlay* NormalOverlay = Mesh.Attributes()->PrimaryNormals();
+    if (!NormalOverlay)
+    {
+        UE_LOG(LogTemp, Error, TEXT("Failed to initialize Normal Overlay"));
+        return;
+    }
+    TArray<int32> NormalHandles;
 
     // --- PASS 1: VERTICES ONLY ---
     for (const FString& Line : Lines)
@@ -495,32 +503,57 @@ void AWoWMapImporterActor::LoadOBJTile(const FString& OBJPath, const FIntPoint& 
         GlobalUVHandles.Add(UVOverlay->AppendElement(FVector2f(RotatedU, RotatedV)));
     }
 
-    // --- PASS 3: FACES ---
+    // --- PASS NORMALS ---
+    for (const FString& Line : Lines)
+    {
+        if (Line.StartsWith(TEXT("vn ")))
+        {
+            TArray<FString> Parts;
+            Line.ParseIntoArray(Parts, TEXT(" "), true);
+
+            if (Parts.Num() < 4) continue;
+
+            // Swizzle to match your Vertex math: (-Z, X, Y)
+            float NX = FCString::Atof(*Parts[1]);
+            float NY = FCString::Atof(*Parts[2]);
+            float NZ = FCString::Atof(*Parts[3]);
+
+            // FVector3f is used for Normals in the Overlay
+            FVector3f UENormal(-(float)NZ, (float)NX, (float)NY);
+            NormalHandles.Add(NormalOverlay->AppendElement(UENormal));
+        }
+    }
+
+    // --- PASS FACES ---
     for (const FString& Line : Lines)
     {
         if (Line.StartsWith(TEXT("f ")))
         {
             TArray<FString> Parts;
             Line.ParseIntoArray(Parts, TEXT(" "), true);
-
-            // We need at least 4 parts: "f", "v1/vt1/vn1", "v2/vt2/vn2", "v3/vt3/vn3"
             if (Parts.Num() < 4) continue;
 
-            // Lambda helper to grab the first number (vertex index) from the v/vt/vn string
-            auto GetVIdx = [](const FString& InPart) -> int32 {
-                FString VPart;
-                // Split by '/' and take the left side
-                if (InPart.Split(TEXT("/"), &VPart, nullptr))
-                {
-                    return FCString::Atoi(*VPart) - 1; // OBJ is 1-indexed
+            // Helper to parse "v/vt/vn" and return all three indices
+            auto ParseOBJIndices = [](const FString& InPart, int32& OutV, int32& OutVN) {
+                TArray<FString> SubParts;
+                InPart.ParseIntoArray(SubParts, TEXT("/"), false);
+
+                OutV = FCString::Atoi(*SubParts[0]) - 1;
+
+                // The normal index is the 3rd part (index 2)
+                if (SubParts.Num() >= 3) {
+                    OutVN = FCString::Atoi(*SubParts[2]) - 1;
                 }
-                return FCString::Atoi(*InPart) - 1; // Fallback if no '/' exists
-                };
+                else {
+                    OutVN = OutV; // Fallback
+                }
+            };
 
             // NOW we declare them so the compiler can find them
-            int32 v0 = GetVIdx(Parts[1]);
-            int32 v1 = GetVIdx(Parts[2]);
-            int32 v2 = GetVIdx(Parts[3]);
+            int32 v0, vn0, v1, vn1, v2, vn2;
+            ParseOBJIndices(Parts[1], v0, vn0);
+            ParseOBJIndices(Parts[2], v1, vn1);
+            ParseOBJIndices(Parts[3], v2, vn2);
 
             int32 TriID = Mesh.AppendTriangle(v0, v1, v2);
 
@@ -535,6 +568,18 @@ void AWoWMapImporterActor::LoadOBJTile(const FString& OBJPath, const FIntPoint& 
                         GlobalUVHandles[v0],
                         GlobalUVHandles[v1],
                         GlobalUVHandles[v2]
+                    ));
+                }
+
+                // Set Normals from the file
+                if (NormalHandles.IsValidIndex(vn0) &&
+                    NormalHandles.IsValidIndex(vn1) &&
+                    NormalHandles.IsValidIndex(vn2))
+                {
+                    NormalOverlay->SetTriangle(TriID, FIndex3i(
+                        NormalHandles[vn0],
+                        NormalHandles[vn1],
+                        NormalHandles[vn2]
                     ));
                 }
             }
