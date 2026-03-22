@@ -12,7 +12,7 @@ public class wowbuilder006 : ModuleRules
 			"Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput",
 			"GeometryFramework", "GeometryCore", "DynamicMesh",
 			"Json", "JsonUtilities", "GeometryCore",
-            "AssetTools","UnrealEd",
+            "AssetRegistry", "AssetTools","UnrealEd",
             "RenderCore","RHI"
         });
 

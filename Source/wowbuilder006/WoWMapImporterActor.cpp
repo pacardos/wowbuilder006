@@ -33,7 +33,8 @@
 #include "Misc/ScopedSlowTask.h"
 // parse adt m2
 #include "Serialization/MemoryReader.h"
-#include "Engine/StaticMeshActor.h"
+// table of missing meshes
+#include "Kismet/GameplayStatics.h"
 
 
 
@@ -331,7 +332,7 @@ void AWoWMapImporterActor::ShowTileGrid()
                             })
                 ]
 
-            + SVerticalBox::Slot().AutoHeight()
+            + SVerticalBox::Slot().AutoHeight().Padding(10)
                 [
                     SNew(SButton)
                         .Text(FText::FromString("Deselect"))
@@ -353,7 +354,7 @@ void AWoWMapImporterActor::ShowTileGrid()
                             })
                 ]
 
-            + SVerticalBox::Slot().AutoHeight()
+            + SVerticalBox::Slot().AutoHeight().Padding(10)
                 [
                     SNew(SButton)
                         .Text(FText::FromString("Cancel"))
@@ -364,6 +365,18 @@ void AWoWMapImporterActor::ShowTileGrid()
                                     WeakWindow.Pin()->RequestDestroyWindow();
                                 }
 
+                                return FReply::Handled();
+                            })
+                ]
+
+            + SVerticalBox::Slot().AutoHeight().Padding(10)
+                [
+                    SNew(SButton)
+                        .Text(FText::FromString("M2 Update"))
+                        .ToolTipText(FText::FromString("Checks the Missing M2 Table and swaps placeholders for assigned meshes."))
+                        .OnClicked_Lambda([this]()
+                            {
+                                UpdateM2Doodads();
                                 return FReply::Handled();
                             })
                 ]
@@ -1265,6 +1278,10 @@ void AWoWMapImporterActor::SpawnM2Doodad(FString WoWPath, FVector Loc, FRotator 
 
     if (bIsMissing)
     {
+        // --- RECORD THE MISS ---
+        // This will create/update the MapName_M2 table in /Game/maps/MapName/
+        RecordMissingM2(WoWPath);
+
         // Use a basic Engine cube as a placeholder
         Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
     }
@@ -1282,17 +1299,106 @@ void AWoWMapImporterActor::SpawnM2Doodad(FString WoWPath, FVector Loc, FRotator 
         // Finalize
         SMC->UpdateBounds();
         
-        // Labeling
+        // Use the "MISSING_" prefix so the Update function can find them later
         FString Label = bIsMissing ? FString::Printf(TEXT("MISSING_%s"), *MeshName) : MeshName;
         NewDoodad->SetActorLabel(Label);
-
-        // Organize in folders
         NewDoodad->SetFolderPath(FName(TEXT("Doodads")));
 
         // --- APPLY TWO-SIDED MATERIAL ---
         // Would you like the code here to apply the alpha-transparency material?
         // Maybe in another time in the future!!
     }
+}
+
+void AWoWMapImporterActor::RecordMissingM2(FString WoWPath)
+{
+    FString PackagePath = FString::Printf(TEXT("/Game/maps/%s/%s_M2"), *MapName, *MapName);
+    UDataTable* Table = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *PackagePath));
+
+    if (!Table)
+    {
+        UPackage* Package = CreatePackage(*PackagePath);
+        Table = NewObject<UDataTable>(Package, FName(*(MapName + "_M2")), RF_Public | RF_Standalone);
+        Table->RowStruct = FMissingM2Row::StaticStruct();
+        FAssetRegistryModule::AssetCreated(Table);
+    }
+
+    if (Table->RowStruct == nullptr)
+    {
+        Table->RowStruct = FMissingM2Row::StaticStruct();
+        // This prevents the "corrupted" state from persisting 
+        // by marking the file as 'Needs Saving' with the new fix.
+        Table->MarkPackageDirty();
+
+    }
+
+    FName RowName = FName(*FPaths::GetBaseFilename(WoWPath));
+    if (!Table->FindRow<FMissingM2Row>(RowName, ""))
+    {
+        FMissingM2Row NewRow;
+        NewRow.FullFilePath = WoWPath;
+        NewRow.ChosenMesh = nullptr;
+        Table->AddRow(RowName, NewRow);
+        Table->MarkPackageDirty();
+    }
+}
+
+void AWoWMapImporterActor::UpdateM2Doodads()
+{
+    FString PackagePath = FString::Printf(TEXT("/Game/maps/%s/%s_M2"), *MapName, *MapName);
+    UDataTable* Table = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *PackagePath));
+
+    // 1. Check if table exists
+    if (!Table)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("M2 Table not found. No Doodads imports or tile without Doodads."));
+        return;
+    }
+
+    if (Table->RowStruct == nullptr)
+    {
+        Table->RowStruct = FMissingM2Row::StaticStruct();
+
+        // This prevents the "corrupted" state from persisting 
+        // by marking the file as 'Needs Saving' with the new fix.
+        Table->MarkPackageDirty();
+    }
+
+    TArray<AActor*> AllActors;
+    UGameplayStatics::GetAllActorsOfClass(GetWorld(), AStaticMeshActor::StaticClass(), AllActors);
+    TArray<FName> RowsToDelete;
+
+    // 2. Iterate through table
+    Table->ForeachRow<FMissingM2Row>(TEXT("Scanning"), [&](const FName& Key, const FMissingM2Row& Row)
+        {
+            if (Row.ChosenMesh)
+            {
+                FString SearchPattern = FString::Printf(TEXT("MISSING_%s"), *Key.ToString());
+                bool bFoundAtLeastOne = false;
+
+                for (AActor* Actor : AllActors)
+                {
+                    if (Actor->GetActorLabel().StartsWith(SearchPattern))
+                    {
+                        AStaticMeshActor* SMA = Cast<AStaticMeshActor>(Actor);
+                        SMA->GetStaticMeshComponent()->SetStaticMesh(Row.ChosenMesh);
+                        SMA->GetStaticMeshComponent()->UpdateBounds();
+                        SMA->SetActorLabel(Key.ToString());
+                        bFoundAtLeastOne = true;
+                    }
+                }
+                if (bFoundAtLeastOne) RowsToDelete.Add(Key);
+            }
+        });
+
+    // 3. Cleanup and Log result
+    for (FName RowKey : RowsToDelete)
+    {
+        Table->RemoveRow(RowKey);
+    }
+
+    Table->MarkPackageDirty();
+    UE_LOG(LogTemp, Log, TEXT("M2 Update Complete. Fixed %d types."), RowsToDelete.Num());
 }
 
 
