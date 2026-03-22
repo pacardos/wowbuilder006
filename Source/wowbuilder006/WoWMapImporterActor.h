@@ -60,10 +60,13 @@ private:
     FString ConvertWoWPathToUnreal(FString WoWPath);
     void ApplyMaterialToActor(FString InActorLabel, UMaterialInterface* Mat);
 
-
-
-
-
     void ImportM2Doodads(const FIntPoint& Tile);
+    void SpawnM2Doodad(FString AssetPath, FVector Loc, FRotator Rot, FVector Scale);
+
+
+
+
+
+
     void ImportWMOs(const FIntPoint& Tile);
 };

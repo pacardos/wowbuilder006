@@ -29,6 +29,11 @@
 #include "Factories/MaterialInstanceConstantFactoryNew.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "RenderingThread.h" // Required for FlushRenderingCommands
+// progress bar
+#include "Misc/ScopedSlowTask.h"
+// parse adt m2
+#include "Serialization/MemoryReader.h"
+#include "Engine/StaticMeshActor.h"
 
 
 
@@ -1005,7 +1010,7 @@ void AWoWMapImporterActor::ImportTextures(const FIntPoint& Tile)
             // Pink Fallback if texture is missing or slot is empty
             if (!LayerTex)
             {
-                LayerTex = LoadObject<UTexture2D>(nullptr, TEXT("/Game/maps/textures/T_Error_White"));
+                LayerTex = LoadObject<UTexture2D>(nullptr, TEXT("/Game/_Textures/T_Error_White"));
             }
 
             MIC->SetTextureParameterValueEditorOnly(ParamName, LayerTex);
@@ -1136,11 +1141,167 @@ void AWoWMapImporterActor::ApplyMaterialToActor(FString InActorLabel, UMaterialI
 }
 
 
+void AWoWMapImporterActor::ImportM2Doodads(const FIntPoint& Tile)
+{
+    FString ADTPath = FPaths::Combine(WorkingDirectory, FString::Printf(TEXT("%s_%d_%d.adt"), *MapName, Tile.X, Tile.Y));
+    TArray<uint8> RawData;
+    if (!FFileHelper::LoadFileToArray(RawData, *ADTPath)) return;
+
+    FMemoryReader Reader(RawData);
+    TArray<FString> M2Paths;
+
+    // Progress Bar setup
+    FScopedSlowTask Progress(100.0f, FText::FromString("Importing M2 Doodads..."));
+    Progress.MakeDialog();
+
+    float wowtilesize = (1600.0f / 3.0f);
+    float woworigin = wowtilesize * 32.0f;
+    
+
+    while (!Reader.AtEnd())
+    {
+        uint32 ChunkID;
+        uint32 ChunkSize;
+        Reader << ChunkID;
+        Reader << ChunkSize;
+        int64 NextChunk = Reader.Tell() + ChunkSize;
+
+        // Convert 4-byte ID to String (e.g., 'X DMM' -> "MMDX")
+        ANSICHAR IdChars[5] = { (ANSICHAR)(ChunkID & 0xFF), (ANSICHAR)((ChunkID >> 8) & 0xFF), (ANSICHAR)((ChunkID >> 16) & 0xFF), (ANSICHAR)((ChunkID >> 24) & 0xFF), '\0' };
+        FString Tag(IdChars);
+        // Reverse because of Endianness
+        Tag = Tag.Reverse();
+
+        if (Tag == "MMDX")
+        {
+            TArray<uint8> StringBlock;
+            StringBlock.AddUninitialized(ChunkSize);
+            Reader.Serialize(StringBlock.GetData(), ChunkSize);
+
+            FString Current;
+            for (uint8 Byte : StringBlock)
+            {
+                if (Byte == 0) {
+                    if (!Current.IsEmpty()) M2Paths.Add(Current);
+                    Current = "";
+                }
+                else {
+                    Current.AppendChar((ANSICHAR)Byte);
+                }
+            }
+        }
+        else if (Tag == "MDDF")
+        {
+            int32 EntryCount = ChunkSize / 36;
+            for (int i = 0; i < EntryCount; i++)
+            {
+                uint32 NameID, UniqueID;
+                float pX, pY, pZ; // Raw floats for position
+                float rX, rY, rZ; // Raw floats for rotation
+                uint16 Scale, Flags;
+
+                // Read exactly 36 bytes per entry
+                Reader << NameID;
+                Reader << UniqueID;
+                Reader << pX; Reader << pY; Reader << pZ; // Position
+                Reader << rX; Reader << rY; Reader << rZ; // Rotation
+                Reader << Scale;
+                Reader << Flags;
+
+                // UE_LOG(LogTemp, Warning, TEXT("M2 Raw Pos: %f, %f, %f | Rot: %f, %f, %f | Scale: %d"), pX, pY, pZ, rX, rY, rZ, Scale);
+
+                if (M2Paths.IsValidIndex(NameID))
+                {
+                    // ***** POSITION *****
+                    // Raw values from MDDF (pX, pY, pZ)
+                    float meshueX = pZ;
+                    float meshueY = pX;
+                    float meshueZ = pY;
+
+                    float UnrealX = (-woworigin + meshueX) * 100.0f;
+                    float UnrealY = (woworigin - meshueY) * 100.0f;
+                    float UnrealZ = meshueZ * 100.0f;
+
+                    FVector FinalPos(UnrealX, UnrealY, UnrealZ);
+                    
+                    // ***** ROTATION *****
+                    // 1. Create the 'Stand Up' base (The 90-degree Roll that worked manually)
+                    FQuat StandUpQuat = FQuat(FVector(1, 0, 0), FMath::DegreesToRadians(-90.0f));
+
+                    // 2. Create the 'Spin' (Your 12.5 degree Yaw)
+                    // Note: We use the raw values from the MDDF chunk
+                    FQuat WoW_Roll = FQuat(FVector(1, 0, 0), FMath::DegreesToRadians(-rZ)); //rX
+                    FQuat WoW_Pitch = FQuat(FVector(0, 1, 0), FMath::DegreesToRadians(rX)); //rY
+                    FQuat WoW_Yaw = FQuat(FVector(0, 0, 1), FMath::DegreesToRadians(-rY));   //rZ
+
+                    // 3. Combine them in the correct World Order
+                    // We multiply from right to left (Base first, then Lean, then Spin)
+                    FQuat FinalQuat = WoW_Yaw * WoW_Pitch * WoW_Roll * StandUpQuat;
+
+                    // 4. Convert to Rotator
+                    FRotator FinalRot = FinalQuat.Rotator();
+
+                    // ***** Scale *****
+                    float FinalScale = (float)Scale / 1024.0f * 100.0f;
+
+                    // Now pass this to your spawn function
+                    SpawnM2Doodad(M2Paths[NameID], FinalPos, FinalRot, FVector(FinalScale));
+                }
+            }
+        }
+        Reader.Seek(NextChunk);
+    }
+}
+
+void AWoWMapImporterActor::SpawnM2Doodad(FString WoWPath, FVector Loc, FRotator Rot, FVector Scale)
+{
+    // Convert WoW path to Unreal Path
+    FString UnrealPath = ConvertWoWPathToUnreal(WoWPath);
+    FString MeshName = FPaths::GetBaseFilename(WoWPath);
+
+    // Try to load the mesh. LoadObject is fast if already in memory.
+    UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *UnrealPath);
+    bool bIsMissing = (Mesh == nullptr);
+
+    if (bIsMissing)
+    {
+        // Use a basic Engine cube as a placeholder
+        Mesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+    }
+
+    // Spawn the Actor
+    FActorSpawnParameters SpawnParams;
+    AStaticMeshActor* NewDoodad = GetWorld()->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), Loc, Rot, SpawnParams);
+
+    if (NewDoodad && Mesh)
+    {
+        UStaticMeshComponent* SMC = NewDoodad->GetStaticMeshComponent();
+        SMC->SetStaticMesh(Mesh);
+        NewDoodad->SetActorScale3D(Scale);
+
+        // Finalize
+        SMC->UpdateBounds();
+        
+        // Labeling
+        FString Label = bIsMissing ? FString::Printf(TEXT("MISSING_%s"), *MeshName) : MeshName;
+        NewDoodad->SetActorLabel(Label);
+
+        // Organize in folders
+        NewDoodad->SetFolderPath(FName(TEXT("Doodads")));
+
+        // --- APPLY TWO-SIDED MATERIAL ---
+        // Would you like the code here to apply the alpha-transparency material?
+        // Maybe in another time in the future!!
+    }
+}
 
 
 
 
 
 
-void AWoWMapImporterActor::ImportM2Doodads(const FIntPoint& Tile) {}
+
+
+
+
 void AWoWMapImporterActor::ImportWMOs(const FIntPoint& Tile) {}
